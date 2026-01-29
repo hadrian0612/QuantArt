@@ -1,0 +1,8 @@
+logs/
+__pycache__/
+*.pyc
+.env
+
+# 行情数据和选股结果不提交（体量大，且可本地重新拉取/生成）
+data/
+results/
