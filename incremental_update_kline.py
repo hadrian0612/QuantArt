@@ -252,6 +252,7 @@ def update_one_incremental(
     market: str,
     default_start_date: Optional[str] = None,
     is_retry: bool = False,
+    request_delay: float = 0.0,
 ) -> bool:
     """
     增量更新单只股票的K线数据
@@ -263,6 +264,7 @@ def update_one_incremental(
         market: 市场类型 "A"/"HK"/"US"
         default_start_date: 默认开始日期 YYYYMMDD（当文件为空时使用，None则不处理空文件）
         is_retry: 是否为延迟重试（用于区分首次尝试和最后统一重试）
+        request_delay: 每次请求前的随机延时秒数（0 表示不延时，用于降低限流概率）
     
     Returns:
         bool: True表示成功，False表示失败（需要延迟重试）
@@ -274,10 +276,9 @@ def update_one_incremental(
         # 文件为空或不存在，使用默认开始日期
         if default_start_date is None:
             logger.warning(f"{code} ({market}) 文件不存在或为空，跳过增量更新（请使用全量抓取脚本或设置 --default-start）")
-            return
-        else:
-            start_date = default_start_date
-            logger.info(f"{code} ({market}) 文件为空，使用默认开始日期: {start_date} → {end_date}")
+            return True
+        start_date = default_start_date
+        logger.info(f"{code} ({market}) 文件为空，使用默认开始日期: {start_date} → {end_date}")
     else:
         # 计算增量起始日期（最后日期+1天）
         start_date = (last_date + pd.Timedelta(days=1)).strftime("%Y%m%d")
@@ -286,21 +287,32 @@ def update_one_incremental(
         # 如果最后日期已经 >= 结束日期，无需更新
         if last_date >= end_dt:
             logger.debug(f"{code} ({market}) 数据已是最新，最后日期: {last_date.date()}")
-            return
+            return True
         
         # 如果起始日期 > 结束日期，也无需更新
         if pd.to_datetime(start_date) > end_dt:
-            return
+            return True
         logger.info(f"{code} ({market}) 增量更新: {start_date} → {end_date} (最后日期: {last_date.date()})")
     
-    # 连接错误：短延时重试（最多3次）
-    # 其他错误：如果是首次尝试，记录后返回False；如果是延迟重试，直接失败
+    # 连接错误/封禁：循环内重试；其他错误：首次也重试若干次再进入统一重试
     max_attempts = 3
+    end_date_is_today = pd.to_datetime(end_date).date() == dt.date.today()
     
     for attempt in range(1, max_attempts + 1):
         try:
+            if request_delay > 0:
+                time.sleep(random.uniform(request_delay * 0.5, request_delay * 1.5))
             # 获取增量数据
             new_df = _get_kline_akshare(code, start_date, end_date, market)
+            
+            # 若请求的是“今天”但返回空，且本地最后日期早于今天，尝试用“昨天”再抓一次（数据源常 T+1）
+            if new_df.empty and end_date_is_today and last_date is not None:
+                yesterday = (dt.date.today() - dt.timedelta(days=1)).strftime("%Y%m%d")
+                if pd.to_datetime(start_date) <= pd.to_datetime(yesterday):
+                    logger.info(f"{code} ({market}) 今日数据暂未出，改用结束日期 {yesterday} 重试")
+                    if request_delay > 0:
+                        time.sleep(random.uniform(request_delay * 0.5, request_delay * 1.5))
+                    new_df = _get_kline_akshare(code, start_date, yesterday, market)
             
             if new_df.empty:
                 logger.debug(f"{code} ({market}) 无新数据")
@@ -354,16 +366,18 @@ def update_one_incremental(
                     logger.warning(f"{code} ({market}) 连接错误，3次重试均失败，将延迟重试")
                     return False
             else:
-                # 其他错误：如果是首次尝试，记录后返回False（延迟重试）
-                # 如果是延迟重试，直接失败
+                # 其他错误：在循环内再重试几次；若是延迟重试阶段则直接失败
                 if is_retry:
                     logger.error(f"{code} ({market}) 延迟重试失败，已跳过：[{error_type}] {error_msg}")
                     return False
+                if attempt < max_attempts:
+                    other_delay = 5
+                    logger.warning(f"{code} ({market}) 第 {attempt} 次抓取失败，{other_delay} 秒后重试：[{error_type}] {error_msg}")
+                    time.sleep(other_delay)
                 else:
-                    logger.warning(f"{code} ({market}) 第 {attempt} 次抓取失败（非连接错误），将延迟重试：[{error_type}] {error_msg}")
+                    logger.warning(f"{code} ({market}) 第 {attempt} 次抓取仍失败，将进入统一重试：[{error_type}] {error_msg}")
                     return False
     
-    # 理论上不会到这里
     return False
 
 # --------------------------- 主入口 --------------------------- #
@@ -375,7 +389,9 @@ def main():
     parser.add_argument("--default-start", default="20250101", help="默认开始日期 YYYYMMDD（当文件为空时使用，默认：20250101）")
     parser.add_argument("--market", choices=["A", "HK", "US", "all"], default="all", 
                         help="市场类型：A(仅A股), HK(仅港股), US(仅美股), all(全部，默认)")
-    parser.add_argument("--workers", type=int, default=6, help="并发线程数（默认：6）")
+    parser.add_argument("--workers", type=int, default=4, help="并发线程数（默认：4，降低可提高抓取成功率）")
+    parser.add_argument("--request-delay", type=float, default=0.5, metavar="SEC",
+                        help="每次请求前的随机延时基数（秒），实际延时为该值的 0.5~1.5 倍（默认：0.5，可减少限流）")
     args = parser.parse_args()
     
     # ---------- 日期解析 ---------- #
@@ -450,7 +466,7 @@ def main():
         
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_task = {
-                executor.submit(update_one_incremental, code, csv_path, end_date, market, default_start_date, is_retry): (code, csv_path, market)
+                executor.submit(update_one_incremental, code, csv_path, end_date, market, default_start_date, is_retry, args.request_delay): (code, csv_path, market)
                 for code, csv_path, market in market_tasks
             }
             
@@ -533,10 +549,13 @@ if __name__ == "__main__":
 使用示例：
 
 # 更新所有市场的K线数据到今天（空文件从20250101开始）
-python incremental_update_kline.py --data-dir ./data --end today --default-start 20250101 --workers 6
+python incremental_update_kline.py --data-dir ./data --end today --default-start 20250101 --workers 4 --request-delay 0.5
+
+# 若经常抓不到指定日期，可提高成功率：减少并发、增加请求间隔、或结束日期用昨天
+# python incremental_update_kline.py --data-dir ./data --end today --default-start 20250101 --workers 3 --request-delay 1.0
 
 # 只更新A股数据到指定日期
-python incremental_update_kline.py --data-dir ./data --end 20250115 --market A --default-start 20250101 --workers 6
+python incremental_update_kline.py --data-dir ./data --end today --market A --default-start 20250101 --workers 6
 
 # 只更新港股数据（使用自定义默认开始日期）
 python incremental_update_kline.py --data-dir ./data --end today --market HK --default-start 20250101 --workers 6

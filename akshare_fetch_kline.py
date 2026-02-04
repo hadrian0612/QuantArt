@@ -453,12 +453,12 @@ if __name__ == "__main__":
 使用示例：
 
 # 只抓取A股
-python akshare_fetch_kline.py \
-    --start 20250101 \
-    --end today \
-    --stocklist ./data/stocklist.csv \
-    --exclude-boards gem star bj \
-    --out ./data \
+python akshare_fetch_kline.py 
+    --start 20250101 
+    --end today 
+    --stocklist ./data/stocklist.csv 
+    --exclude-boards gem star bj 
+    --out ./data 
     --workers 6
 
 # 只抓取港股

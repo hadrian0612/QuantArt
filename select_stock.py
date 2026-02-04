@@ -245,7 +245,7 @@ def main():
         default=Path("./config"),
         help="当未指定 --config 时，从该目录下自动加载所有配置文件",
     )
-    parser.add_argument("--date", help="交易日 YYYY-MM-DD；缺省=数据最新日期")
+    parser.add_argument("--date", help="交易日 YYYY-MM-DD 或 today；缺省=数据最新日期")
     parser.add_argument("--market", choices=["A", "HK", "US", "all"], default="A", help="市场类型：A(仅A股), HK(仅港股), US(仅美股), all(全部)")
     parser.add_argument("--tickers", default="all", help="'all' 或逗号分隔股票代码列表（仅用于指定市场）")
     args = parser.parse_args()
@@ -302,7 +302,11 @@ def main():
     
     # --- 确定交易日期 ---
     if args.date:
-        trade_date = pd.to_datetime(args.date)
+        if str(args.date).strip().lower() == "today":
+            trade_date = pd.Timestamp.today().normalize()
+            logger.info("已指定 --date today，交易日: %s", trade_date.date())
+        else:
+            trade_date = pd.to_datetime(args.date)
     else:
         # 收集所有有效的最大日期
         valid_dates = []
@@ -323,6 +327,17 @@ def main():
     
     if not args.date:
         logger.info(f"未指定 --date，使用最近日期 {trade_date.date()}")
+    
+    # 统计数据未更新至交易日的股票数（仅提示，不排除这些股票）
+    stale_count = 0
+    for df in all_data.values():
+        if df.empty or "date" not in df.columns:
+            continue
+        max_d = df["date"].dropna().max()
+        if pd.notna(max_d) and pd.Timestamp(max_d).normalize() < pd.Timestamp(trade_date).normalize():
+            stale_count += 1
+    if stale_count > 0:
+        logger.info("注意：有 %d 只股票数据未更新至交易日 %s，将按已有最近数据参与选股（不会排除）", stale_count, trade_date.date())
     
     # --- 加载Selector配置 ---
     if args.config is not None:
@@ -462,10 +477,11 @@ if __name__ == "__main__":
 
 '''
 # 运行少妇战法选股（A股，使用默认配置）
-python select_stock.py --data-dir ./data --market A
+python select_stock.py --data-dir ./data --market A --date today 
 
-# 指定日期
+# 指定日期（支持 YYYY-MM-DD 或 today）
 python select_stock.py --data-dir ./data --market A --date 2025-01-26
+
 
 # 多市场
 python select_stock.py --data-dir ./data --market all
